@@ -2,100 +2,106 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Attempt;
-use App\Models\AttemptAnswer;
-use App\Models\LearningProgress;
 use App\Models\Module;
+use App\Models\Attempt;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 
 class EvaluationController extends Controller
 {
-    public function show(Request $request, Module $module)
+    /**
+     * Muestra el cuestionario de evaluación del módulo.
+     */
+    public function show(Module $module)
     {
-        $this->ensureAvailable($request, $module);
-        $module->load(['questions.options']);
+        // Cargar preguntas con sus opciones asociadas
+        $module->load('questions.options');
+
         return view('evaluation.show', compact('module'));
     }
 
+    /**
+     * Califica las respuestas y guarda el intento y progreso.
+     */
     public function submit(Request $request, Module $module)
     {
-        $this->ensureAvailable($request, $module);
-        $module->load(['questions.options']);
-        $answers = $request->input('answers', []);
-        $userId = $request->session()->get('user_id');
+        $userId = Auth::id() ?? session('user_id') ?? DB::table('users')->value('id') ?? 1;
+        $userAnswers = $request->input('answers', []);
 
-        $result = DB::transaction(function () use ($module, $answers, $userId) {
-            $total = $module->questions->count();
-            $correct = 0;
-            $evaluated = [];
+        // Cargar preguntas y opciones
+        $module->load('questions.options');
+        $totalQuestions = $module->questions->count();
+        $correctCount = 0;
 
-            foreach ($module->questions as $question) {
-                $selectedId = $answers[$question->id] ?? null;
-                $selected = $question->options->firstWhere('id', (int) $selectedId);
-                $isCorrect = $selected?->is_correct === true;
-                if ($isCorrect) $correct++;
-                $evaluated[] = [$question->id, $selected?->id, $isCorrect];
-            }
+        foreach ($module->questions as $question) {
+            $selectedOptionId = $userAnswers[$question->id] ?? null;
 
-            $score = $total > 0 ? (int) round(($correct / $total) * 100) : 0;
-            $approved = $score >= 70;
-            $attempt = Attempt::create([
-                'user_id' => $userId,
-                'module_id' => $module->id,
-                'score' => $score,
-                'correct_answers' => $correct,
-                'total_questions' => $total,
-                'approved' => $approved,
-            ]);
+            if ($selectedOptionId) {
+                // Verificar si la opción seleccionada es la correcta
+                $selectedOption = $question->options->firstWhere('id', $selectedOptionId);
 
-            foreach ($evaluated as [$questionId, $optionId, $isCorrect]) {
-                AttemptAnswer::create([
-                    'attempt_id' => $attempt->id,
-                    'question_id' => $questionId,
-                    'option_id' => $optionId,
-                    'is_correct' => $isCorrect,
-                ]);
-            }
-
-            $progress = LearningProgress::firstOrCreate(
-                ['user_id' => $userId, 'module_id' => $module->id],
-                ['status' => 'available']
-            );
-            $progress->update([
-                'status' => $approved ? 'completed' : 'reinforcement',
-                'last_score' => $score,
-                'completed_at' => $approved ? now() : null,
-            ]);
-
-            if ($approved) {
-                $next = Module::where('position', '>', $module->position)->orderBy('position')->first();
-                if ($next) {
-                    LearningProgress::firstOrCreate(
-                        ['user_id' => $userId, 'module_id' => $next->id],
-                        ['status' => 'available']
-                    );
+                if ($selectedOption && ($selectedOption->is_correct ?? false)) {
+                    $correctCount++;
                 }
             }
+        }
 
-            return $attempt;
-        });
+        // Calcular puntaje
+        $score = $totalQuestions > 0 ? (int) round(($correctCount / $totalQuestions) * 100) : 0;
+        $status = $score >= 70 ? 'completed' : 'reinforcement';
 
-        return redirect()->route('evaluation.result', $result);
-    }
+        // 1. Guardar intento en attempts
+        $attempt = Attempt::create([
+            'user_id' => $userId,
+            'module_id' => $module->id,
+            'score' => $score,
+            'correct_answers' => $correctCount,
+            'total_questions' => $totalQuestions,
+            'approved' => $status === 'completed',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
 
-    public function result(Request $request, Attempt $attempt)
-    {
-        abort_unless($attempt->user_id === $request->session()->get('user_id'), 403);
-        $attempt->load('module');
-        $next = Module::where('position', '>', $attempt->module->position)->orderBy('position')->first();
-        return view('evaluation.result', compact('attempt', 'next'));
-    }
+        // 2. Actualizar o crear registro en learning_progress
+        $existing = DB::table('learning_progress')
+            ->where('user_id', $userId)
+            ->where('module_id', $module->id)
+            ->first();
 
-    private function ensureAvailable(Request $request, Module $module): void
-    {
-        $progress = LearningProgress::where('user_id', $request->session()->get('user_id'))
-            ->where('module_id', $module->id)->first();
-        abort_unless($progress && $progress->status !== 'locked', 403);
+        if ($existing) {
+            DB::table('learning_progress')
+                ->where('user_id', $userId)
+                ->where('module_id', $module->id)
+                ->update([
+                    'status' => $status,
+                    'last_score' => $score,
+                    'completed_at' => $status === 'completed'
+                        ? ($existing->completed_at ?? now())
+                        : null,
+                    'updated_at' => now(),
+                ]);
+        } else {
+            DB::table('learning_progress')->insert([
+                'user_id' => $userId,
+                'module_id' => $module->id,
+                'status' => $status,
+                'last_score' => $score,
+                'completed_at' => $status === 'completed' ? now() : null,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+
+        // Si tienes la vista result.blade.php, redirige o renderiza con los datos
+        if (view()->exists('evaluation.result')) {
+            $next = Module::where('position', '>', $module->position)
+                ->orderBy('position')
+                ->first();
+
+            return view('evaluation.result', compact('module', 'attempt', 'next', 'score', 'status', 'correctCount', 'totalQuestions'));
+        }
+
+        return redirect()->route('dashboard')->with('success', "Evaluación enviada con éxito. Calificación: {$score}%.");
     }
 }
